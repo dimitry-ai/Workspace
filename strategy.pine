@@ -1,0 +1,398 @@
+//@version=6
+// ----------------------------------------------------------------------------
+// Strategy: EMA Cross + SMA Regime + RSI/ADX + Trend Forecast + Risk Controls
+// Cleaned & documented version with structured blocks and short explanations.
+// ----------------------------------------------------------------------------
+strategy(
+     "EMA Cross + SMA Regime + RSI/ADX (clean, with exits & labels)",
+     overlay=true,
+     calc_on_every_tick=true,
+     initial_capital=20000,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=100,
+     pyramiding=0
+)
+
+// ============================================================================
+// 1) INPUTS
+// ============================================================================
+// --- Chandelier / ATR ---
+ch_length  = input.int(10, "Chandelier Periode (n)", minval=1)
+ch_atrMult = input.float(4.0, "Chandelier ATR-Multiplikator", minval=0.1, step=0.1)
+useChandelierTrail = input.bool(false, "Chandelier-Trailing Stop aktiv")
+
+// --- Trend & regime ---
+fastLen   = input.int(30, "EMA schnell", minval=1)
+slowLen   = input.int(45, "EMA langsam", minval=1)
+regimeLen = input.int(65, "SMA Regime", minval=1)
+smaRegFaktor = input.float(1.1, "SMA Regime Faktor", step=0.01)
+useRegimeFilter = input.bool(true, "Filter: SMA-Regime aktiv")
+
+// --- Momentum / strength ---
+rsiLen    = input.int(10, "RSI Länge", minval=1)
+dmiLen    = input.int(10, "DMI Länge", minval=1)
+adxSmooth = input.int(10, "ADX Glättung", minval=1)
+
+rsiLong   = input.float(57, "RSI Long-Schwelle", step=0.1)
+rsiShort  = input.float(40, "RSI Short-Schwelle", step=0.1)
+adxTh     = input.float(18, "ADX Mindestwert", step=0.1)
+useRsiFilter = input.bool(true, "Filter: RSI aktiv")
+useAdxFilter = input.bool(true, "Filter: ADX aktiv (Short)")
+
+// --- Trade management ---
+avgPeriod = input.int(10, "EMA-Durchschnittsperiode (z.B. 10 oder 20)")
+useHardStops = input.bool(true, "Hard Stop aktiv (Long/Short)")
+useTakeProfit = input.bool(true, "Take Profit aktiv (Long/Short)")
+longStopPerc = input.float(3.0, "Long Stop %", step=0.1)
+shortStopPerc = input.float(3.0, "Short Stop %", step=0.1)
+longTpPerc = input.float(1.3, "Long Take Profit %", step=0.1)
+shortTpPerc = input.float(1.3, "Short Take Profit %", step=0.1)
+minHoldBarsLong = input.int(10, "Min Bars in Long-Trade", minval=0)
+minHoldBarsShort = input.int(10, "Min Bars in Short-Trade", minval=0)
+
+// --- Historical volatility ---
+VolaLengthAVGP = input.int(864, "Vola: AVG Periode")
+VolaLength = input.int(100, "Vola: Periode")
+VolaOffsetBars = input.int(20, "Vola: Offset (Kerzen zurück)")
+hv_offset_value_long = input.float(0.1, "Vola: Offset Value Long")
+hv_offset_value_short = input.float(0.1, "Vola: Offset Value Short")
+
+// --- Trend Forecast block ---
+tfLength      = input.int(90, "TF Smoothing Length")
+tfTrendLength = input.int(3, "TF Trend Detection Sensitivity")
+tfSamples     = input.int(50, "TF Trend Sample Size", minval=2)
+useTrendForecastExit = input.bool(true, "Trend Forecast Exit aktiv (Short)")
+
+// --- Time filter ---
+useTimeFilter = input.bool(true, "Nur 1h nach Open & 1h vor Close handeln")
+userSession   = input.session("0930-1600", "Fallback-Session (HHMM-HHMM[,HHMM-HHMM])")
+showDebug     = input.bool(true, "Debug anzeigen")
+
+// ============================================================================
+// 2) HELPERS / TIME WINDOW
+// ============================================================================
+// Session parser helpers (fallback if exchange session is not available).
+// Note: Uses exchange timezone for time() checks.
+
+toMinutes(hhmm) =>
+    hh = str.tonumber(str.substring(hhmm, 0, 2))
+    mm = str.tonumber(str.substring(hhmm, 2, 4))
+    hh * 60 + mm
+
+fromMinutes(m) =>
+    hh = int(math.floor(m / 60)) % 24
+    mm = int(m % 60)
+    str.tostring(hh, "00") + str.tostring(mm, "00")
+
+getOpenClose(sessStr) =>
+    // Gibt [openStr, closeStr] oder [na, na] zurück
+    if na(sessStr) or str.length(sessStr) == 0 or str.contains(str.lower(sessStr), "24x7")
+        [na, na]
+    else
+        blocks = str.split(sessStr, ",")
+        first  = array.get(blocks, 0)
+        last   = array.get(blocks, array.size(blocks) - 1)
+        a = str.split(str.trim(first), "-")
+        b = str.split(str.trim(last), "-")
+        if array.size(a) < 2 or array.size(b) < 2
+            [na, na]
+        else
+            // Öffnung = Start der ERSTEN Teil-Session
+            // Schluss  = Ende  der LETZTEN Teil-Session
+            [array.get(a, 0), array.get(b, 1)]
+
+[o1, c1] = getOpenClose(syminfo.session)
+[oF, cF] = getOpenClose(userSession)
+
+useFallback = na(o1) or na(c1)
+openStr  = useFallback ? oF : o1
+closeStr = useFallback ? cF : c1
+
+canFilter = not na(openStr) and not na(closeStr)
+openMin  = canFilter ? toMinutes(openStr)  : 0
+closeMin = canFilter ? toMinutes(closeStr) : 0
+
+firstHourStartStr = openStr
+lastHourEndStr    = closeStr
+firstHourEndStr   = fromMinutes(openMin + 60)
+lastHourStartStr  = fromMinutes(closeMin - 60)
+
+firstHourSession = firstHourStartStr + "-" + firstHourEndStr
+lastHourSession  = lastHourStartStr  + "-" + lastHourEndStr
+
+inFirstHour = canFilter and not na(time(timeframe.period, firstHourSession, syminfo.timezone))
+inLastHour  = canFilter and not na(time(timeframe.period, lastHourSession,  syminfo.timezone))
+
+inAllowedWindow = not useTimeFilter ? true : (canFilter and (inFirstHour or inLastHour))
+
+// ============================================================================
+// 3) INDICATORS / FEATURES
+// ============================================================================
+emaFast = ta.ema(close, fastLen)
+emaSlow = ta.ema(close, slowLen)
+smaReg  = ta.sma(close, regimeLen)
+
+rsi = ta.rsi(close, rsiLen)
+[plusDI, minusDI, adx] = ta.dmi(dmiLen, adxSmooth)
+
+// Trend Strength Index (TSI proxy) - currently uses correlation to time.
+length = input.int(50, "Length")
+src = input.source(close, "Source")
+momentum = src - src[1]
+ema1 = ta.ema(momentum, length)
+ema2 = ta.ema(ema1, length)
+abs_ema1 = ta.ema(math.abs(momentum), length)
+abs_ema2 = ta.ema(abs_ema1, length)
+// NOTE: This line replaces classic TSI; if you intended classic TSI, switch back.
+tsi = ta.correlation(src, float(bar_index), length)
+
+// SMA/EMA average distance (smoother trend separation)
+emaFastAvg = ta.ema(emaFast, avgPeriod)
+emaSlowAvg = ta.ema(emaSlow, avgPeriod)
+distance = emaFastAvg - emaSlowAvg
+
+vwma = ta.vwma(close, 10)
+
+// Historical volatility (annualized, default daily factor)
+returns = math.log(close / close[1])
+stdev = ta.stdev(returns, VolaLength)
+stdevAVGP = ta.stdev(returns, VolaLengthAVGP)
+hv = stdev * math.sqrt(252) * 100
+hvAVGP = stdevAVGP * math.sqrt(252) * 100
+hv_offset = hv[VolaOffsetBars]
+
+// ============================================================================
+// 4) TREND FORECAST BLOCK
+// ============================================================================
+var bool trend      = bool(na) // true = Long, false = Short
+var int  tfCount    = 0
+var bullishCount = array.new<int>()
+var bearishCount = array.new<int>()
+float forecast = na
+
+// HMA for trend direction
+// (trend flips when HMA rises/falls over tfTrendLength)
+tfHma = ta.hma(close, tfLength)
+
+isRising = ta.rising(tfHma, tfTrendLength)
+isFalling = ta.falling(tfHma, tfTrendLength)
+
+if barstate.isconfirmed
+    if isRising
+        trend := true
+    if isFalling
+        trend := false
+
+if trend or not trend
+    tfCount += 1
+
+if trend != trend[1]
+    if trend
+        bearishCount.push(tfCount)
+    else
+        bullishCount.push(tfCount)
+    tfCount := 0
+
+if bullishCount.size() > tfSamples
+    bullishCount.shift()
+if bearishCount.size() > tfSamples
+    bearishCount.shift()
+
+bullAvg = bullishCount.size() > 0 ? bullishCount.avg() : na
+bearAvg = bearishCount.size() > 0 ? bearishCount.avg() : na
+
+forecast := trend ? bullAvg : bearAvg
+int forecastBars = math.round(forecast)
+
+// ============================================================================
+// 5) SIGNALS
+// ============================================================================
+longTrendStart = trend[0] and trend
+shortTrendStart = trend[1] and not trend
+
+longSignal = (
+    ta.crossover(emaFast, emaSlow) and
+    (not useRegimeFilter or emaFast > smaReg / smaRegFaktor) and
+    (not useRsiFilter or rsi > rsiLong) and
+    (not useTimeFilter or inAllowedWindow)
+)
+
+shortSignal = (
+    shortTrendStart and
+    (not useRegimeFilter or emaFast < smaReg * smaRegFaktor) and
+    (not useRsiFilter or rsi < rsiShort) and
+    (not useAdxFilter or adx > adxTh) and
+    (not useTimeFilter or inAllowedWindow)
+)
+
+// ============================================================================
+// 6) POSITION STATE & EXITS
+// ============================================================================
+var barCount = 0
+barCount := strategy.position_size > 0 ? barCount + 1 : 0
+
+var barCountShort = 0
+barCountShort := strategy.position_size < 0 ? barCountShort + 1 : 0
+
+sar = ta.sar(0.01, 0.001, 0.2)
+
+// (Removed unused short-TP arming logic; TP handled via strategy.exit below)
+
+// Chandelier calculation (for optional trailing use)
+chHigh = ta.highest(high, ch_length)
+chLow = ta.lowest(low, ch_length)
+atrVal  = ta.atr(ch_length)
+ceLong = chHigh - ch_atrMult * atrVal
+ceShort = chLow + ch_atrMult * atrVal
+
+longExitCond =
+    strategy.position_size > 0 and
+    barCount > minHoldBarsLong and
+    (emaFast / smaReg - 1) * 100 < 0.4 and
+    tsi < 0.25
+
+shortExitCond =
+    strategy.position_size < 0 and
+    barCountShort > minHoldBarsShort and
+    (not useTrendForecastExit or barCountShort > forecastBars) and
+    (smaReg / vwma - 1) * 100 > 0.5
+
+// Hard stops & take-profits (symmetric)
+longStopPrice = strategy.position_avg_price * (1 - longStopPerc / 100.0)
+shortStopPrice = strategy.position_avg_price * (1 + shortStopPerc / 100.0)
+longTpPrice = strategy.position_avg_price * (1 + longTpPerc / 100.0)
+shortTpPriceHard = strategy.position_avg_price * (1 - shortTpPerc / 100.0)
+
+longHardSL = useHardStops and strategy.position_size > 0 and close < longStopPrice
+shortHardSL = useHardStops and strategy.position_size < 0 and close > shortStopPrice
+
+// ============================================================================
+// 7) EARNINGS & EOD LOGIC
+// ============================================================================
+// Earnings exit: close all on the last regular bar of the day before earnings.
+var int nextEarnings = na
+if barstate.isfirst
+    nextEarnings := earnings.future_time
+
+bool hasFutureEarnings = not na(nextEarnings)
+int eYear  = hasFutureEarnings ? year(nextEarnings)      : na
+int eMonth = hasFutureEarnings ? month(nextEarnings)     : na
+int eDay   = hasFutureEarnings ? dayofmonth(nextEarnings): na
+
+int earningsMidnight = hasFutureEarnings
+     ? timestamp(syminfo.timezone, eYear, eMonth, eDay, 0, 0)
+     : na
+
+const int DAY_MS = 24 * 60 * 60 * 1000
+int dayBeforeMidnight = hasFutureEarnings ? earningsMidnight - DAY_MS : na
+
+bool isDayBeforeEarnings =
+     hasFutureEarnings and
+     year(time)      == year(dayBeforeMidnight) and
+     month(time)     == month(dayBeforeMidnight) and
+     dayofmonth(time)== dayofmonth(dayBeforeMidnight)
+
+bool isLastBarOfDay = session.islastbar_regular
+bool isEarningsExitBar = isDayBeforeEarnings and isLastBarOfDay and barstate.isconfirmed
+
+// EOD exit for losing trades (Europe/Berlin session)
+inSession  = not na(time(timeframe.period, "1530-2200", "Europe/Berlin"))
+h = hour(time, "Europe/Berlin")
+m = minute(time, "Europe/Berlin")
+sessionCloseH   = 22
+sessionCloseMin = 0
+sessionOpenH   = 15
+sessionOpenMin = 30
+
+minsToClose = (sessionCloseH * 60 + sessionCloseMin) - (h * 60 + m)
+minsToOpen = (h * 60 + m) - (sessionOpenH * 60 + sessionOpenMin)
+
+eodExit = inSession and minsToClose <= 10 and minsToClose >= 0
+bodExit = inSession and minsToOpen >= 0 and minsToOpen < 11
+
+isLosingShort = strategy.position_size < 0 and close > strategy.position_avg_price
+isLosingLong = strategy.position_size > 0 and close < strategy.position_avg_price
+
+// ============================================================================
+// 8) ORDERS
+// ============================================================================
+if longSignal and not eodExit and not bodExit
+    strategy.close("SHORT", comment="EXIT on LONG")
+    strategy.entry("LONG", strategy.long, comment="LONG")
+
+if shortSignal and not eodExit and not bodExit
+    strategy.close("LONG", comment="EXIT on SHORT")
+    strategy.entry("SHORT", strategy.short, comment="SHORT")
+
+if longExitCond
+    strategy.close("LONG", comment="LONG EXIT")
+
+if shortExitCond
+    strategy.close("SHORT", comment="SHORT EXIT")
+
+if eodExit and isLosingShort
+    strategy.close_all(comment="EOD losing short")
+
+if eodExit and isLosingLong
+    strategy.close_all(comment="EOD losing long")
+
+if longHardSL
+    strategy.close("LONG", comment="LONG SL (Hard Stop)")
+
+if shortHardSL
+    strategy.close("SHORT", comment="SHORT SL (Hard Stop)")
+
+if isEarningsExitBar
+    strategy.close_all(comment="earnings exit")
+
+// Centralized exits (optional): stops/TP/trailing
+if useHardStops or useTakeProfit or useChandelierTrail
+    strategy.exit(
+        "LONG EXIT MGMT",
+        from_entry="LONG",
+        stop=useChandelierTrail ? ceLong : (useHardStops ? longStopPrice : na),
+        limit=useTakeProfit ? longTpPrice : na
+    )
+    strategy.exit(
+        "SHORT EXIT MGMT",
+        from_entry="SHORT",
+        stop=useChandelierTrail ? ceShort : (useHardStops ? shortStopPrice : na),
+        limit=useTakeProfit ? shortTpPriceHard : na
+    )
+
+// ============================================================================
+// 9) PLOTS / ALERTS
+// ============================================================================
+plot(emaFast, title="EMA schnell", color=color.orange, linewidth=2)
+plot(emaSlow, title="EMA langsam", color=color.teal, linewidth=2)
+plot(smaReg,  title="SMA Regime",  color=color.blue, linewidth=2)
+
+alertcondition(longSignal, title="LONG Signal", message="LONG Signal")
+alertcondition(shortSignal, title="SHORT Signal", message="SHORT Signal")
+alertcondition(longExitCond, title="LONG EXIT", message="LONG EXIT")
+alertcondition(shortExitCond, title="SHORT EXIT", message="SHORT EXIT")
+
+if longSignal
+    alert("LONG Signal", alert.freq_once_per_bar_close)
+if shortSignal
+    alert("SHORT Signal", alert.freq_once_per_bar_close)
+if longExitCond
+    alert("LONG EXIT", alert.freq_once_per_bar_close)
+if shortExitCond
+    alert("SHORT EXIT", alert.freq_once_per_bar_close)
+
+// ============================================================================
+// 10) STRATEGY REVIEW (NOTES / IMPROVEMENTS)
+// ============================================================================
+// - Overlap/Redundancy: multiple trend filters (EMA cross + SMA regime + ADX/RSI)
+//   can reduce signals dramatically; consider testing which filter adds value.
+// - TSI proxy uses correlation to time; if classic TSI is intended, restore
+//   the standard formula (100 * ema2 / abs_ema2) and validate thresholds.
+// - Time window filter is now optional via input; test with/without to avoid
+//   regime leakage.
+// - Risk: symmetric stops/TPs are now inputs; tune separately for long/short.
+// - Volatility features are calculated but unused in signals; either integrate
+//   or remove to simplify.
+// - Consider using strategy.exit with stop/limit/trailing to centralize exits.
+// - Forecast-based exit depends on HMA trend lengths; verify robustness across
+//   symbols/timeframes and add min/max clamps for forecastBars.
